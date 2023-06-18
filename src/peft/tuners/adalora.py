@@ -9,7 +9,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.pytorch_utils import Conv1D
 
+
 from ..utils import (
+    COMMON_LAYERS_PATTERN,
     TRANSFORMERS_MODELS_TO_ADALORA_TARGET_MODULES_MAPPING,
     PeftType,
     _freeze_adapter,
@@ -23,9 +25,8 @@ from .lora import (
     mark_only_lora_as_trainable,
 )
 
+from ..import_utils import is_bnb_4bit_available, is_bnb_available
 
-def is_bnb_available():
-    return importlib.util.find_spec("bitsandbytes") is not None
 
 
 if is_bnb_available():
@@ -124,82 +125,130 @@ class AdaLoraModel(LoraModel):
         else:
             self.trainable_adapter_name = adapter_name
             self.rankallocator = RankAllocator(self.model, self.peft_config[adapter_name], self.trainable_adapter_name)
-
-    def _find_and_replace(self, adapter_name):
-        lora_config = self.peft_config[adapter_name]
+    
+    def _check_quantization_dependency(self):
+        loaded_in_4bit = getattr(self.model, "is_loaded_in_4bit", False)
         loaded_in_8bit = getattr(self.model, "is_loaded_in_8bit", False)
-        if loaded_in_8bit and not is_bnb_available():
+        if (loaded_in_4bit or loaded_in_8bit) and not is_bnb_available():
             raise ImportError(
-                "To use Lora with 8-bit quantization, please install the `bitsandbytes` package. "
+                "To use Lora with 8-bit or 4-bit quantization, please install the `bitsandbytes` package. "
                 "You can install it with `pip install bitsandbytes`."
             )
-        is_target_modules_in_base_model = False
+    
+    def _check_target_module_exists(self, lora_config, key):
+        if isinstance(lora_config.target_modules, str):
+            target_module_found = re.fullmatch(lora_config.target_modules, key)
+        else:
+            target_module_found = any(key.endswith(target_key) for target_key in lora_config.target_modules)
+            is_using_layer_indexes = getattr(lora_config, "layers_to_transform", None) is not None
+            layer_indexing_pattern = getattr(lora_config, "layers_pattern", None)
+
+            if is_using_layer_indexes and target_module_found:
+                layers_pattern = COMMON_LAYERS_PATTERN if layer_indexing_pattern is None else layer_indexing_pattern
+                layers_pattern = [layers_pattern] if isinstance(layers_pattern, str) else layers_pattern
+
+                for pattern in layers_pattern:
+                    layer_index = re.match(f".*.{pattern}\.(\d+)\.*", key)
+                    if layer_index is not None:
+                        layer_index = int(layer_index.group(1))
+                        if isinstance(lora_config.layers_to_transform, int):
+                            target_module_found = layer_index == lora_config.layers_to_transform
+                        else:
+                            target_module_found = layer_index in lora_config.layers_to_transform
+
+                        break
+                    else:
+                        target_module_found = False
+        return target_module_found
+    
+    def _create_new_module(self, lora_config, adapter_name, target):
+        bias = hasattr(target, "bias") and target.bias is not None
         kwargs = {
-            "r": lora_config.init_r,
+            "r": lora_config.r,
             "lora_alpha": lora_config.lora_alpha,
             "lora_dropout": lora_config.lora_dropout,
             "fan_in_fan_out": lora_config.fan_in_fan_out,
             "init_lora_weights": lora_config.init_lora_weights,
         }
-        key_list = [key for key, _ in self.model.named_modules()]
-        for key in key_list:
-            if isinstance(lora_config.target_modules, str):
-                target_module_found = re.fullmatch(lora_config.target_modules, key)
-            else:
-                target_module_found = any(key.endswith(target_key) for target_key in lora_config.target_modules)
-            if target_module_found:
-                if not is_target_modules_in_base_model:
-                    is_target_modules_in_base_model = True
-                parent, target, target_name = _get_submodules(self.model, key)
-                bias = target.bias is not None
-                if isinstance(target, LoraLayer):
-                    target.update_layer(
-                        adapter_name,
-                        lora_config.init_r,
-                        lora_config.lora_alpha,
-                        lora_config.lora_dropout,
-                        lora_config.init_lora_weights,
-                    )
-                else:
-                    if loaded_in_8bit and isinstance(target, bnb.nn.Linear8bitLt):
-                        kwargs.update(
-                            {
-                                "has_fp16_weights": target.state.has_fp16_weights,
-                                "memory_efficient_backward": target.state.memory_efficient_backward,
-                                "threshold": target.state.threshold,
-                                "index": target.index,
-                            }
-                        )
-                        new_module = SVDLinear8bitLt(
-                            adapter_name, target.in_features, target.out_features, bias=bias, **kwargs
-                        )
-                    else:
-                        if isinstance(target, torch.nn.Linear):
-                            in_features, out_features = target.in_features, target.out_features
-                            if kwargs["fan_in_fan_out"]:
-                                warnings.warn(
-                                    "fan_in_fan_out is set to True but the target module is `torch.nn.Linear`. "
-                                    "Setting fan_in_fan_out to False."
-                                )
-                                kwargs["fan_in_fan_out"] = lora_config.fan_in_fan_out = False
-                        elif isinstance(target, Conv1D):
-                            in_features, out_features = (
-                                target.weight.ds_shape if hasattr(target.weight, "ds_shape") else target.weight.shape
-                            )
-                            if not kwargs["fan_in_fan_out"]:
-                                warnings.warn(
-                                    "fan_in_fan_out is set to False but the target module is `Conv1D`. "
-                                    "Setting fan_in_fan_out to True."
-                                )
-                                kwargs["fan_in_fan_out"] = lora_config.fan_in_fan_out = True
-                        else:
-                            raise ValueError(
-                                f"Target module {target} is not supported. "
-                                f"Currently, only `torch.nn.Linear` and `Conv1D` are supported."
-                            )
-                        new_module = SVDLinear(adapter_name, in_features, out_features, bias=bias, **kwargs)
+        loaded_in_4bit = getattr(self.model, "is_loaded_in_4bit", False)
+        loaded_in_8bit = getattr(self.model, "is_loaded_in_8bit", False)
 
-                    self._replace_module(parent, target_name, new_module, target)
+        if loaded_in_8bit and isinstance(target, bnb.nn.Linear8bitLt):
+            eightbit_kwargs = kwargs.copy()
+            eightbit_kwargs.update(
+                {
+                    "has_fp16_weights": target.state.has_fp16_weights,
+                    "memory_efficient_backward": target.state.memory_efficient_backward,
+                    "threshold": target.state.threshold,
+                    "index": target.index,
+                }
+            )
+            new_module = SVDLinear8bitLt(
+                adapter_name, target.in_features, target.out_features, bias=bias, **eightbit_kwargs
+            )
+        elif loaded_in_4bit and is_bnb_4bit_available() and isinstance(target, bnb.nn.Linear4bit):
+            fourbit_kwargs = kwargs.copy()
+            fourbit_kwargs.update(
+                {
+                    "compute_dtype": target.compute_dtype,
+                    "compress_statistics": target.weight.compress_statistics,
+                    "quant_type": target.weight.quant_type,
+                }
+            )
+            new_module = SVDLinear4bitLt(adapter_name, target.in_features, target.out_features, bias=bias, **fourbit_kwargs)
+        else:
+            if isinstance(target, torch.nn.Linear):
+                in_features, out_features = target.in_features, target.out_features
+                if kwargs["fan_in_fan_out"]:
+                    warnings.warn(
+                        "fan_in_fan_out is set to True but the target module is `torch.nn.Linear`. "
+                        "Setting fan_in_fan_out to False."
+                    )
+                    kwargs["fan_in_fan_out"] = lora_config.fan_in_fan_out = False
+            elif isinstance(target, Conv1D):
+                in_features, out_features = (
+                    target.weight.ds_shape if hasattr(target.weight, "ds_shape") else target.weight.shape
+                )
+                if not kwargs["fan_in_fan_out"]:
+                    warnings.warn(
+                        "fan_in_fan_out is set to False but the target module is `Conv1D`. "
+                        "Setting fan_in_fan_out to True."
+                    )
+                    kwargs["fan_in_fan_out"] = lora_config.fan_in_fan_out = True
+            else:
+                raise ValueError(
+                    f"Target module {target} is not supported. "
+                    f"Currently, only `torch.nn.Linear` and `Conv1D` are supported."
+                )
+            new_module = SVDLinear(adapter_name, in_features, out_features, bias=bias, **kwargs)
+
+        return new_module
+    
+    def _find_and_replace(self, adapter_name):
+        lora_config = self.peft_config[adapter_name]
+        self._check_quantization_dependency()
+        is_target_modules_in_base_model = False
+        key_list = [key for key, _ in self.model.named_modules()]
+
+        for key in key_list:
+            if not self._check_target_module_exists(lora_config, key):
+                continue
+
+            is_target_modules_in_base_model = True
+            parent, target, target_name = _get_submodules(self.model, key)
+
+            if isinstance(target, LoraLayer):
+                target.update_layer(
+                    adapter_name,
+                    lora_config.r,
+                    lora_config.lora_alpha,
+                    lora_config.lora_dropout,
+                    lora_config.init_lora_weights,
+                )
+            else:
+                new_module = self._create_new_module(lora_config, adapter_name, target)
+                self._replace_module(parent, target_name, new_module, target)
+
         if not is_target_modules_in_base_model:
             raise ValueError(
                 f"Target modules {lora_config.target_modules} not found in the base model. "
@@ -509,6 +558,75 @@ if is_bnb_available():
                     )
                 result += output
             return result
+    
+    if is_bnb_4bit_available():
+
+        class SVDLinear4bitLt(bnb.nn.Linear4bit, AdaLoraLayer):
+            # Low-rank matrix for SVD-based adaptation
+            def __init__(
+                self,
+                adapter_name,
+                in_features,
+                out_features,
+                r: int = 0,
+                lora_alpha: int = 1,
+                lora_dropout: float = 0.0,
+                **kwargs      
+            ):
+                bnb.nn.Linear4bit.__init__(
+                    self,
+                    in_features,
+                    out_features,
+                    bias=kwargs.get("bias", True),
+                    compute_dtype=kwargs.get("compute_dtype", torch.float32),
+                    compress_statistics=kwargs.get("compress_statistics", True),
+                    quant_type=kwargs.get("quant_type", "nf4")
+                )
+                AdaLoraLayer.__init__(self, in_features=in_features, out_features=out_features)
+                # Freezing the pre-trained weight matrix
+                self.weight.requires_grad = False
+
+                init_lora_weights = kwargs.pop("init_lora_weights", True)
+                self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights)
+                self.active_adapter = adapter_name
+
+            def forward(self, x: torch.Tensor):
+                result = super().forward(x)
+
+                if self.disable_adapters or self.active_adapter not in self.lora_A.keys():
+                    return result
+                elif self.r[self.active_adapter] > 0:
+                    if not torch.is_autocast_enabled():
+                        expected_dtype = result.dtype
+
+                        if x.dtype != torch.float32:
+                            x = x.float()
+                        output = (
+                            (
+                                self.lora_dropout[self.active_adapter](x)
+                                @ (self.lora_A[self.active_adapter] * self.lora_E[self.active_adapter]).T
+                                @ self.lora_B[self.active_adapter].T
+                            ).to(expected_dtype)
+                            * self.scaling[self.active_adapter]
+                            / (self.ranknum[self.active_adapter] + 1e-5)
+                        )
+                    else:
+                        output = (
+                            (
+                            self.lora_dropout[self.active_adapter](x)
+                            @ (self.lora_A[self.active_adapter] * self.lora_E[self.active_adapter]).T
+                            @ self.lora_B[self.active_adapter].T
+                            )
+                            * self.scaling[self.active_adapter]
+                            / (self.ranknum[self.active_adapter] + 1e-5)
+                        )
+                    result += output
+                return result
+
+
+                
+
+
 
 
 class RankAllocator(object):
@@ -637,6 +755,10 @@ class RankAllocator(object):
             torch.cat(all_score),
             k=self.init_bgt - budget,
         )[0].item()
+        print(torch.kthvalue(
+            torch.cat(all_score),
+            k=self.init_bgt - budget,
+        ))
 
         rank_pattern = {}
         # Mask the unimportant triplets
