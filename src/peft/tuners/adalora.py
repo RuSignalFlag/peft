@@ -755,10 +755,6 @@ class RankAllocator(object):
             torch.cat(all_score),
             k=self.init_bgt - budget,
         )[0].item()
-        print(torch.kthvalue(
-            torch.cat(all_score),
-            k=self.init_bgt - budget,
-        ))
 
         rank_pattern = {}
         # Mask the unimportant triplets
